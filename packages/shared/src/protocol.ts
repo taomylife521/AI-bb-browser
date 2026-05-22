@@ -36,7 +36,11 @@ export type ActionType =
   | "console"
   | "errors"
   | "trace"
-  | "history";
+  | "history"
+  | "site_run"
+  | "site_list"
+  | "site_info"
+  | "site_search";
 
 /** 请求类型 */
 export interface Request {
@@ -115,6 +119,14 @@ export interface Request {
   status?: string;
   /** 返回条数限制（observation 命令使用） */
   limit?: number;
+  /** Site adapter 名称（site_run, site_info 命令使用） */
+  siteName?: string;
+  /** Site adapter 参数（site_run 命令使用） */
+  siteArgs?: Record<string, string>;
+  /** 搜索查询字符串（site_search 命令使用） */
+  query?: string;
+  /** 是否包含 base64 数据（screenshot 命令使用） */
+  includeBase64?: boolean;
 }
 
 /** 元素引用信息 */

@@ -40,7 +40,6 @@ import {
 } from "../packages/shared/src/daemon-client.ts";
 import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { unlink, readFile as readFileAsync } from "node:fs/promises";
-import { execFile } from "node:child_process";
 import { join, dirname, resolve, relative, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -534,22 +533,7 @@ function encodeOutput(value: unknown): Uint8Array {
   return textEncoder.encode(JSON.stringify(value ?? {}));
 }
 
-/** Run a site adapter via CLI */
-function runSiteCli(args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile("bb-browser", ["site", ...args], { timeout: 30000, encoding: "utf8" }, (err, stdout, stderr) => {
-      if (err) {
-        const distPath = new URL("../dist/cli.js", import.meta.url).pathname;
-        execFile("node", [distPath, "site", ...args], { timeout: 30000, encoding: "utf8" }, (err2, stdout2, stderr2) => {
-          if (err2) reject(new Error(stdout2.trim() || stderr2 || err2.message));
-          else resolve(stdout2.trim());
-        });
-      } else {
-        resolve(stdout.trim());
-      }
-    });
-  });
-}
+
 
 async function executeBrowserCommand(cmdName: string, input: InputObject): Promise<unknown> {
   const cmd = BROWSER_COMMANDS.find((c) => c.name === cmdName);
@@ -568,15 +552,22 @@ async function executeBrowserCommand(cmdName: string, input: InputObject): Promi
 }
 
 async function executeSiteCommand(clipName: string, command: string, input: InputObject): Promise<unknown> {
-  // Build CLI args from input
-  const cliArgs: string[] = ["run", `${clipName}/${command}`, "--json"];
-  for (const [key, value] of Object.entries(input)) {
-    if (value !== undefined && value !== null && value !== "") {
-      cliArgs.push(`--${key}`, String(value));
-    }
-  }
-  const raw = await runSiteCli(cliArgs);
-  try { return JSON.parse(raw); } catch { return { output: raw }; }
+  await ensureDaemon();
+  const { tab, ...siteArgs } = input;
+  const request: Request = {
+    id: generateId(),
+    action: "site_run" as Request["action"],
+    siteName: `${clipName}/${command}`,
+    siteArgs: Object.fromEntries(
+      Object.entries(siteArgs)
+        .filter(([, v]) => v !== undefined && v !== null && v !== "")
+        .map(([k, v]) => [k, String(v)])
+    ),
+    ...(tab !== undefined ? { tabId: String(tab) } : {}),
+  } as Request;
+  const response = await daemonCommand(request);
+  if (!response.success) throw new Error(response.error || "Site command failed");
+  return response.data ?? {};
 }
 
 // ---------------------------------------------------------------------------

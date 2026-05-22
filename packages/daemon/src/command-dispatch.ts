@@ -20,6 +20,7 @@ import type {
 } from "@bb-browser/shared";
 import { CdpConnection, type CdpTargetInfo } from "./cdp-connection.js";
 import type { TabState } from "./tab-state.js";
+import { getAllSites, executeSiteAdapter } from "./site-adapter.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1095,6 +1096,60 @@ export async function dispatchRequest(
     // -----------------------------------------------------------------------
     case "history": {
       return fail(request.id, "History command is not supported in daemon mode");
+    }
+
+    // -----------------------------------------------------------------------
+    // Site adapters
+    // -----------------------------------------------------------------------
+    case "site_list": {
+      const sites = getAllSites();
+      return ok(request.id, {
+        sites: sites.map(s => ({
+          name: s.name, description: s.description, domain: s.domain, source: s.source,
+        })),
+      } as ExtResponseData);
+    }
+
+    case "site_info": {
+      const name = request.siteName;
+      if (!name) return fail(request.id, "Missing siteName");
+      const sites = getAllSites();
+      const site = sites.find(s => s.name === name);
+      if (!site) return fail(request.id, `Site adapter "${name}" not found`);
+      return ok(request.id, {
+        name: site.name, description: site.description, domain: site.domain,
+        args: site.args, example: site.example, readOnly: site.readOnly,
+      } as ExtResponseData);
+    }
+
+    case "site_search": {
+      const query = (request.query || "").toLowerCase();
+      const sites = getAllSites();
+      const matches = sites.filter(s =>
+        s.name.toLowerCase().includes(query) ||
+        s.description?.toLowerCase().includes(query) ||
+        s.domain?.toLowerCase().includes(query),
+      );
+      return ok(request.id, {
+        sites: matches.map(s => ({
+          name: s.name, description: s.description, domain: s.domain, source: s.source,
+        })),
+      } as ExtResponseData);
+    }
+
+    case "site_run": {
+      const name = request.siteName;
+      const args = request.siteArgs || {};
+      if (!name) return fail(request.id, "Missing siteName");
+      try {
+        const result = await executeSiteAdapter(cdp, name, args, request.tabId);
+        return ok(request.id, {
+          tab: result.tab,
+          result: result.result,
+        } as ExtResponseData);
+      } catch (error) {
+        return fail(request.id, error);
+      }
     }
 
     default:
