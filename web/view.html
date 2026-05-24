@@ -444,14 +444,24 @@ function setStatus(state, text) {
   statusText.textContent = text;
 }
 
-function setConnected(state) {
+// Overlay messages by disconnect reason
+const OVERLAY_MESSAGES = {
+  user: "Disconnected",
+  idle: "Stream closed \u2014 tab was inactive",
+  network: "Connection lost",
+  init: "Click Connect to start",
+};
+
+function setConnected(state, reason) {
   connected = state;
   btnConnect.textContent = state ? "Disconnect" : "Connect";
   btnConnect.classList.toggle("connected", state);
   btnConnect.disabled = false;
   // Video overlay
   videoOverlay.classList.toggle("hidden", state);
-  if (!state) videoOverlay.textContent = "Click Connect to start";
+  if (!state) {
+    videoOverlay.textContent = OVERLAY_MESSAGES[reason] || OVERLAY_MESSAGES.init;
+  }
   // Input overlay cursor
   inputOverlay.classList.toggle("active", state);
   // Tab/URL bar dimming
@@ -711,6 +721,28 @@ function sendInsertText(text) {
   dc.send(buf);
 }
 
+function sendPing() {
+  if (!dc || dc.readyState !== "open") return;
+  try {
+    // Send timestamp as two uint32s (ms since epoch fits in 53 bits)
+    const now = Date.now();
+    const { buf, view } = packHeader(0x08, 8);
+    view.setUint32(3, Math.floor(now / 0x100000000));
+    view.setUint32(7, now >>> 0);
+    dc.send(buf);
+  } catch (e) {
+    debugLog("heartbeat", "ping_error", { message: e.message });
+  }
+}
+
+// --- Heartbeat & Visibility lifecycle ---
+const HEARTBEAT_ACTIVE_MS = 5000;   // ping interval when visible
+const HEARTBEAT_IDLE_MS = 10000;    // ping interval when hidden
+const IDLE_TIMEOUT_MS = 30000;      // disconnect after 30s hidden
+
+let heartbeatTimer = null;
+let idleTimer = null;
+
 // --- Keysym mapping ---
 const SPECIAL_KEYS = {
   Backspace: 0xFF08, Tab: 0xFF09, Enter: 0xFF0D, Escape: 0xFF1B,
@@ -891,15 +923,16 @@ async function connect() {
     debugLog("webrtc", "datachannel", { label: dc.label });
     dc.onopen = () => {
       debugLog("webrtc", "datachannel_open");
-      setConnected(true);
+      setConnected(true, null);
       imeInput.focus();
       // Start tab polling once connected
       fetchTabs();
       startTabPolling();
+      startHeartbeat();
     };
     dc.onclose = () => {
       debugLog("webrtc", "datachannel_close");
-      cleanup();
+      cleanup("network");
     };
   };
 
@@ -910,10 +943,10 @@ async function connect() {
       setStatus("connected", "Connected");
     } else if (state === "failed") {
       setStatus("error", "ICE failed");
-      cleanup();
+      cleanup("network");
     } else if (state === "disconnected") {
       setStatus("error", "ICE disconnected");
-      cleanup();
+      cleanup("network");
     } else if (state === "checking") {
       setStatus("connecting", "ICE: " + state);
     }
@@ -989,14 +1022,20 @@ async function connect() {
   setStatus("connecting", "Waiting for connection...");
 }
 
-async function disconnect() {
-  debugLog("webrtc", "disconnect");
-  try { await invoke("stream.close", {}); } catch {}
-  cleanup();
+async function disconnect(reason) {
+  reason = reason || "user";
+  debugLog("webrtc", "disconnect", { reason });
+  // Fire-and-forget: don't wait for stream.close response.
+  // The server may be slow or unreachable; cleanup must happen immediately
+  // so the UI updates and heartbeat stops.
+  invoke("stream.close", {}).catch(() => {});
+  cleanup(reason);
 }
 
-function cleanup() {
-  debugLog("webrtc", "cleanup");
+function cleanup(reason) {
+  reason = reason || "user";
+  debugLog("webrtc", "cleanup", { reason });
+  stopHeartbeat();
   if (dc) { try { dc.close(); } catch {} dc = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
   if (videoEl.srcObject) {
@@ -1004,8 +1043,62 @@ function cleanup() {
     videoEl.srcObject = null;
   }
   stopTabPolling();
-  setConnected(false);
+  setConnected(false, reason);
 }
+
+// --- Heartbeat lifecycle ---
+function startHeartbeat() {
+  stopHeartbeat();
+  const interval = document.hidden ? HEARTBEAT_IDLE_MS : HEARTBEAT_ACTIVE_MS;
+  heartbeatTimer = setInterval(sendPing, interval);
+  sendPing(); // send immediately
+  debugLog("heartbeat", "start", { interval, hidden: document.hidden });
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+// --- Visibility change: idle timeout ---
+// We use a polling interval instead of setTimeout because browsers heavily
+// throttle timers in hidden tabs (Chrome delays them to >=1 minute).
+// A setTimeout(fn, 30000) in a hidden tab may not fire for over a minute.
+// Instead we record when the tab was hidden and check elapsed time on each
+// heartbeat tick — the interval is throttled but still fires periodically.
+let hiddenSince = 0; // timestamp when tab became hidden, 0 = visible
+
+document.addEventListener("visibilitychange", () => {
+  if (!connected) return;
+
+  if (document.hidden) {
+    hiddenSince = Date.now();
+    debugLog("lifecycle", "tab_hidden", { timeout: IDLE_TIMEOUT_MS });
+    // Switch to idle heartbeat — each tick also checks idle timeout
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+      sendPing();
+      if (hiddenSince > 0 && Date.now() - hiddenSince >= IDLE_TIMEOUT_MS) {
+        debugLog("lifecycle", "idle_timeout", { elapsed: Date.now() - hiddenSince });
+        disconnect("idle");
+      }
+    }, HEARTBEAT_IDLE_MS);
+    sendPing();
+  } else {
+    hiddenSince = 0;
+    debugLog("lifecycle", "tab_visible");
+    // Cancel any pending idle — switch back to active heartbeat
+    stopHeartbeat();
+    heartbeatTimer = setInterval(sendPing, HEARTBEAT_ACTIVE_MS);
+    sendPing();
+  }
+});
 
 // --- Event binding ---
 inputOverlay.addEventListener("mousemove", onMouseMove);
@@ -1021,7 +1114,7 @@ imeInput.addEventListener("compositionstart", onCompositionStart);
 imeInput.addEventListener("compositionend", onCompositionEnd);
 
 btnConnect.addEventListener("click", () => {
-  if (connected) disconnect();
+  if (connected) disconnect("user");
   else connect();
 });
 
@@ -1045,7 +1138,7 @@ window.addEventListener("focus", () => {
 window.addEventListener("beforeunload", () => {
   if (connected) {
     try { invoke("stream.close", {}); } catch {}
-    cleanup();
+    cleanup("user");
   }
 });
 
