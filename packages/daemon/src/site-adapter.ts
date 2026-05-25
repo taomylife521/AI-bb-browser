@@ -256,11 +256,18 @@ export async function executeSiteAdapter(
     shortId = cdp.tabManager.getTab(target.id)?.shortId;
   }
 
-  // Read adapter JS, strip @meta block, compose IIFE
+  // Read adapter JS, strip @meta block, compose IIFE.
+  // If a _helper.js exists in the same directory, prepend it so that shared
+  // functions (e.g. findTransactionIdGenerator for Twitter) are available.
+  const adapterDir = join(site.filePath, "..");
+  const helperPath = join(adapterDir, "_helper.js");
+  const helperScript = existsSync(helperPath)
+    ? readFileSync(helperPath, "utf-8") + "\n"
+    : "";
   const jsContent = readFileSync(site.filePath, "utf-8");
   const jsBody = jsContent.replace(/\/\*\s*@meta[\s\S]*?\*\//, "").trim();
   const argsJson = JSON.stringify(args);
-  const script = `(${jsBody})(${argsJson})`;
+  const script = `(async function(){${helperScript}\nreturn (${jsBody})(${argsJson});})()`;
 
   // Evaluate via CDP (awaitPromise = true)
   const result = await cdp.evaluate<unknown>(targetId, script, true);
