@@ -256,6 +256,7 @@ export function createChromeManager(): ChromeManager {
         "--headless=new",
         "--disable-gpu",
         "--no-sandbox",
+        "about:blank",
       ];
 
       console.error(`${LOG_PREFIX} Launching headless-shell on port ${port}`);
